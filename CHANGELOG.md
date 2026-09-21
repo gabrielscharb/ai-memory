@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   model ids, and which model goes through the Responses endpoint (#763).
 
 ### Fixed
+- Preserved explicit FTS5 phrase adjacency, boolean grouping, NEAR distance, and column filters before query token rewriting; kept natural-language recall and malformed-input fallback unchanged. See [search query syntax](docs/search-query-syntax.md). (#1)
 - The Windows Docker wrapper (`bin/ai-memory.ps1`) now forwards the same
   provider credentials and host-config env vars as the POSIX wrapper into the
   helper container. A host-exported `GEMINI_API_KEY` / `GOOGLE_API_KEY`,
