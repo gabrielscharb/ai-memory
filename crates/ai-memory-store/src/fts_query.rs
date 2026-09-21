@@ -359,6 +359,40 @@ mod tests {
     }
 
     #[test]
+    fn explicit_queries_preserve_production_tokenizer_semantics() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE t USING fts5(title, body,
+                 tokenize = \"unicode61 remove_diacritics 2 tokenchars '/_-'\");
+             INSERT INTO t(title, body) VALUES
+                 ('ai-memory exact phrase', 'deploy'),
+                 ('ai-memory exact unrelated phrase', 'deploy'),
+                 ('ai memory exact phrase', 'deploy'),
+                 ('ai-memory phrase exact', 'deploy'),
+                 ('say hello', 'deploy');",
+        )
+        .unwrap();
+        let mut statement = conn
+            .prepare("SELECT rowid FROM t WHERE t MATCH ?1 ORDER BY rowid")
+            .unwrap();
+        for (raw, expected) in [
+            (r#""ai-memory exact phrase" AND deploy"#, vec![1]),
+            (r#"title:"ai-memory" AND "exact phrase""#, vec![1]),
+            (r#""ai-memory" AND exact*"#, vec![1, 2, 4]),
+            (r#""say ""hello""" AND deploy"#, vec![5]),
+        ] {
+            let prepared = prepare_fts5_query(raw);
+            assert_eq!(prepared, raw);
+            let actual = statement
+                .query_map([prepared.as_str()], |row| row.get::<_, i64>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(actual, expected, "query: {raw}");
+        }
+    }
+
+    #[test]
     fn colon_is_not_column_syntax() {
         // Bare multi-word → OR-joined (no explicit operator present).
         // `ai-memory` expands to BOTH the whole token (matches content) and
