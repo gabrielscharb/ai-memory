@@ -7,7 +7,7 @@
 //! link schemes are neutralised.
 
 use ai_memory_core::PagePath;
-use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, html};
+use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, TagEnd, html};
 
 /// Render a markdown body to HTML using GFM-ish defaults.
 ///
@@ -35,7 +35,7 @@ pub fn render(body: &str, workspace: &str, project: &str) -> String {
     // never survive as a single text node — preprocessing the source is the
     // robust hook. Code (fenced + inline) is skipped so `[[…]]` stays literal
     // there, mirroring the engine's link extractor.
-    let body = preprocess_wikilinks(body, workspace, project);
+    let body = preprocess_wikilinks(body, workspace, project, opts);
 
     let parser =
         Parser::new_ext(&body, opts).map(|event| sanitize_event(event, workspace, project));
@@ -94,66 +94,37 @@ fn scope_relative_link<'a>(dest: CowStr<'a>, workspace: &str, project: &str) -> 
 /// markdown links, skipping fenced code blocks, inline-code spans, and
 /// 4-space-indented code blocks. Targets that aren't internal pages
 /// (external schemes, traversal, empty) are left as literal `[[…]]`.
-fn preprocess_wikilinks(body: &str, workspace: &str, project: &str) -> String {
+fn preprocess_wikilinks(body: &str, workspace: &str, project: &str, options: Options) -> String {
+    if !body.contains("[[") {
+        return body.to_string();
+    }
     let mut out = String::with_capacity(body.len() + 64);
-    // None when outside a fence; Some(char) carrying the opener glyph
-    // (`'`' ` for ```` ``` ````, `'~'` for `~~~`) when inside one. The
-    // CommonMark rule is that a fence closes only with the *same* glyph,
-    // so opening with `~~~` ignores a `` ``` `` line in between and
-    // vice versa.
-    let mut fence: Option<char> = None;
-    for line in body.split_inclusive('\n') {
-        let trimmed = line.trim_start();
-        let leading_indent = line.len() - trimmed.len();
-        if let Some(kind) = fence_glyph(trimmed) {
-            match fence {
-                None => fence = Some(kind),
-                Some(open) if open == kind => fence = None,
-                _ => {} // Mismatched glyph inside a fenced block — literal text.
+    let mut cursor = 0;
+    let mut block_start = None;
+    // Let the renderer's parser decide code boundaries. Counting individual
+    // backticks or toggling on any triple fence changes valid code examples.
+    for (event, range) in Parser::new_ext(body, options).into_offset_iter() {
+        let protected = match event {
+            Event::Start(Tag::CodeBlock(_)) => {
+                block_start = Some(range.start);
+                None
             }
-            out.push_str(line);
-            continue;
-        }
-        if fence.is_some() {
-            out.push_str(line);
-            continue;
-        }
-        // 4-space-indented (or tab-indented) lines are CommonMark code
-        // blocks. A wikilink inside one must stay literal so it ends up
-        // inside the rendered `<pre><code>…</code></pre>`. Blank-only
-        // indented lines are pass-through (paragraph continuation).
-        if !trimmed.is_empty() && (leading_indent >= 4 || line.starts_with('\t')) {
-            out.push_str(line);
-            continue;
-        }
-        // Split on backticks: even segments are outside inline code, odd ones
-        // are inside it (left verbatim). Unbalanced backticks degrade safely.
-        for (i, seg) in line.split('`').enumerate() {
-            if i > 0 {
-                out.push('`');
+            Event::End(TagEnd::CodeBlock) => block_start.take().map(|start| start..range.end),
+            Event::Code(_) => Some(range),
+            _ => None,
+        };
+        if let Some(protected) = protected {
+            for line in body[cursor..protected.start].split_inclusive('\n') {
+                rewrite_wikilinks_in_text(line, workspace, project, &mut out);
             }
-            if i % 2 == 0 {
-                rewrite_wikilinks_in_text(seg, workspace, project, &mut out);
-            } else {
-                out.push_str(seg);
-            }
+            out.push_str(&body[protected.clone()]);
+            cursor = protected.end;
         }
+    }
+    for line in body[cursor..].split_inclusive('\n') {
+        rewrite_wikilinks_in_text(line, workspace, project, &mut out);
     }
     out
-}
-
-/// If `trimmed` opens or closes a CommonMark code fence, return its
-/// opener glyph (`` ` `` or `~`). CommonMark requires at least three
-/// of the same glyph; we accept the lenient "starts with three" rule
-/// to mirror the pulldown-cmark parser's behaviour for our preprocessor.
-fn fence_glyph(trimmed: &str) -> Option<char> {
-    if trimmed.starts_with("```") {
-        Some('`')
-    } else if trimmed.starts_with("~~~") {
-        Some('~')
-    } else {
-        None
-    }
 }
 
 /// Rewrite every `[[…]]` in a non-code text run into a markdown link.
@@ -614,6 +585,49 @@ mod tests {
             html.contains(r#"href="w/ws2/proj2/p/y.md""#),
             "workspace/project scope: {html}"
         );
+    }
+
+    #[test]
+    fn wikilinks_stay_literal_in_commonmark_code_regions() {
+        for code in [
+            "``[[literal]]``",
+            "`` `[[literal]]` ``",
+            "`first\n[[literal]]`",
+            "````\n```\n[[literal]]\n````",
+            "~~~~\n~~~\n[[literal]]\n~~~~",
+            "```\n```rust\n[[literal]]\n```",
+            "> ```\n> [[literal]]\n> ```",
+            "- example\n\n  ```\n  [[literal]]\n  ```",
+            "    ```\n    [[literal]]",
+        ] {
+            let body = format!("Antes \u{00e7}\u{00e3}o.\n\n{code}\n\n[[after]]");
+            let html = render(&body, "default", "scratch");
+            assert!(
+                html.contains("[[literal]]"),
+                "code was rewritten: {code:?}: {html}"
+            );
+            assert!(
+                !html.contains("w/default/scratch/p/literal.md"),
+                "generated link markup leaked into code: {code:?}: {html}"
+            );
+            assert!(
+                html.contains(r#"href="w/default/scratch/p/after.md""#),
+                "prose after code was not linked: {code:?}: {html}"
+            );
+        }
+    }
+
+    #[test]
+    fn unmatched_backticks_do_not_hide_following_wikilinks() {
+        let html = render("unmatched ` [[after]]", "default", "scratch");
+        assert!(html.contains(r#"href="w/default/scratch/p/after.md""#));
+    }
+
+    #[test]
+    fn unclosed_code_fence_keeps_wikilinks_literal() {
+        let html = render("````\n```\n[[literal]]", "default", "scratch");
+        assert!(html.contains("[[literal]]"));
+        assert!(!html.contains("w/default/scratch/p/literal.md"));
     }
 
     #[test]
