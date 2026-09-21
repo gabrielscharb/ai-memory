@@ -98,7 +98,7 @@ id_newtype!(pub PageFeedbackId, "Identifier for one page-feedback signal (`memor
 /// Always uses `/` as the separator (POSIX-style), normalised on construction.
 /// Never starts with a slash; never contains `..` or `.` components. This
 /// invariant lets the store treat paths as flat keys without re-validating.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct PagePath(String);
 
@@ -188,6 +188,17 @@ impl PagePath {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for PagePath {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Keep the same string representation, but not a second unchecked
+        // construction route into a type trusted by store and wiki callers.
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
     }
 }
 
@@ -423,6 +434,67 @@ impl AgentKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn page_path_deserialization_rejects_invalid_structure() {
+        for raw in [
+            "",
+            "/outside.md",
+            "../outside.md",
+            "notes/../../outside.md",
+            "./notes.md",
+            "notes/./item.md",
+            "notes//item.md",
+            "notes/",
+            r"notes\item.md",
+            r"C:\outside.md",
+            "C:/outside.md",
+        ] {
+            assert!(PagePath::new(raw).is_err(), "constructor accepted {raw:?}");
+            let encoded = serde_json::to_string(raw).unwrap();
+            assert!(
+                serde_json::from_str::<PagePath>(&encoded).is_err(),
+                "deserializer accepted {raw:?}"
+            );
+            let target = serde_json::json!({
+                "workspace": null, "project": null, "path": raw
+            });
+            assert!(serde_json::from_value::<crate::LinkTarget>(target).is_err());
+            let yaml = serde_yaml::to_string(raw).unwrap();
+            assert!(serde_yaml::from_str::<PagePath>(&yaml).is_err());
+        }
+    }
+
+    #[test]
+    fn page_path_deserialization_preserves_string_round_trips() {
+        for raw in [
+            "notes/item.md",
+            "notes/with spaces.md",
+            "notas/a\u{00e7}\u{00e3}o.md",
+        ] {
+            let expected = PagePath::new(raw).unwrap();
+            let encoded = serde_json::to_string(&expected).unwrap();
+            assert_eq!(encoded, serde_json::to_string(raw).unwrap());
+            let decoded: PagePath = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, expected);
+            let target = crate::LinkTarget::local(expected);
+            let target_json = serde_json::to_string(&target).unwrap();
+            assert_eq!(
+                serde_json::from_str::<crate::LinkTarget>(&target_json).unwrap(),
+                target
+            );
+        }
+    }
+
+    #[test]
+    fn page_path_deserialization_keeps_legacy_nonportable_names_readable() {
+        for raw in ["CON.md", "notes/a:b.md", "notes/end.md "] {
+            let encoded = serde_json::to_string(raw).unwrap();
+            let decoded: PagePath = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded.as_str(), raw);
+            assert!(decoded.ensure_portable().is_err());
+        }
+    }
 
     #[test]
     fn page_path_accepts_simple() {
