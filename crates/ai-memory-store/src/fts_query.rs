@@ -26,6 +26,12 @@ pub fn prepare_fts5_query(raw: &str) -> String {
         || raw
             .split_whitespace()
             .any(|t| matches!(t, "OR" | "AND" | "NOT" | "NEAR"));
+    // Validate before splitting: quoting individual phrase fragments or
+    // parentheses can produce valid FTS5 with different match semantics.
+    // Keep the natural-language OR-join and malformed-input fallback below.
+    if explicit_syntax && fts5_query_parses(raw) {
+        return raw.to_string();
+    }
     let tokens: Vec<String> = raw
         .split_whitespace()
         // Bare natural-language queries drop stopwords before the
@@ -309,12 +315,47 @@ mod tests {
         let prepared = prepare_fts5_query("title:handoff OR body:deploy");
         assert_parses(&prepared);
         assert_eq!(prepared, "title:handoff OR body:deploy");
-        // Quoted phrases were re-tokenized into escaped-quote form long
-        // before the validation fallback existed; the contract here is
-        // "still valid FTS5 with AND preserved", not byte identity.
         let phrase = prepare_fts5_query("\"exact phrase\" AND deploy");
         assert_parses(&phrase);
-        assert!(phrase.contains(" AND deploy"), "{phrase}");
+        assert_eq!(phrase, "\"exact phrase\" AND deploy");
+    }
+
+    /// Parsing successfully is insufficient: re-tokenization used to widen
+    /// phrase/NEAR matches, change boolean precedence, and lose column scope.
+    #[test]
+    fn explicit_queries_preserve_match_semantics() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE t USING fts5(title, body);
+             INSERT INTO t(title, body) VALUES
+                 ('exact phrase', 'deploy'),
+                 ('exact unrelated phrase', 'deploy'),
+                 ('foo', 'nothing'),
+                 ('bar', 'baz'),
+                 ('foo', 'baz'),
+                 ('alpha beta', 'deploy'),
+                 ('alpha one two three beta', 'deploy'),
+                 ('deploy', 'exact phrase');",
+        )
+        .unwrap();
+        let mut statement = conn
+            .prepare("SELECT rowid FROM t WHERE t MATCH ?1 ORDER BY rowid")
+            .unwrap();
+        for (raw, expected) in [
+            (r#""exact phrase" AND deploy"#, vec![1, 8]),
+            ("(foo OR bar) AND baz", vec![4, 5]),
+            ("NEAR(alpha beta, 1)", vec![6]),
+            (r#"title:"exact phrase" AND body:deploy"#, vec![1]),
+        ] {
+            let prepared = prepare_fts5_query(raw);
+            assert_eq!(prepared, raw);
+            let actual = statement
+                .query_map([prepared.as_str()], |row| row.get::<_, i64>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(actual, expected, "query: {raw}");
+        }
     }
 
     #[test]
@@ -439,34 +480,18 @@ mod tests {
         assert_eq!(prepare_fts5_query("foo NEAR bar"), "foo NEAR bar");
     }
 
-    /// A query containing a quoted phrase is treated as explicit FTS5
-    /// syntax — `"exact phrase" baz` must not become
-    /// `"exact" OR "phrase" OR baz` (which destroys the phrase semantics).
-    /// The exact assertion is "space-joined, not OR-joined"; what the
-    /// individual tokens look like after `prepare_fts5_token` is a
-    /// separate concern (and unchanged from pre-#58 behaviour).
+    /// The phrase must retain adjacency, not merely avoid an OR-join.
     #[test]
     fn quoted_phrase_query_is_not_or_joined() {
-        let q = prepare_fts5_query("\"exact phrase\" baz");
-        assert!(
-            !q.contains(" OR "),
-            "explicit quoted-phrase query must not get OR-joined; got {q}"
-        );
+        let raw = "\"exact phrase\" baz";
+        assert_eq!(prepare_fts5_query(raw), raw);
     }
 
-    /// Same escape-hatch logic for parenthesised sub-expressions —
-    /// `(foo OR bar) AND baz` must survive unmangled.
+    /// Parentheses must retain the caller's boolean precedence.
     #[test]
     fn parenthesised_query_is_not_or_joined() {
-        let q = prepare_fts5_query("(foo OR bar) AND baz");
-        assert!(
-            !q.contains("OR (foo"),
-            "parens detection must skip OR-join entirely; got {q}"
-        );
-        assert!(
-            q.contains("AND"),
-            "explicit AND inside parens query must survive; got {q}"
-        );
+        let raw = "(foo OR bar) AND baz";
+        assert_eq!(prepare_fts5_query(raw), raw);
     }
 
     #[test]
