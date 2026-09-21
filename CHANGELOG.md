@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   model ids, and which model goes through the Responses endpoint (#763).
 
 ### Fixed
+- Ignore ordinary Markdown link destinations with RFC 3986 URI schemes (including schemes without `://`) when building wiki graph edges; relative legacy paths such as `./a:b.md` remain linkable.
 - The Windows Docker wrapper (`bin/ai-memory.ps1`) now forwards the same
   provider credentials and host-config env vars as the POSIX wrapper into the
   helper container. A host-exported `GEMINI_API_KEY` / `GOOGLE_API_KEY`,

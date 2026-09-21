@@ -327,6 +327,15 @@ fn extract_markdown_links(line: &str, page_path: &PagePath, out: &mut BTreeSet<L
     }
 }
 
+fn has_uri_scheme(target: &str) -> bool {
+    let Some((scheme, _)) = target.split_once(':') else {
+        return false;
+    };
+    let mut chars = scheme.chars();
+    matches!(chars.next(), Some(first) if first.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+}
+
 fn normalize_link_target(raw: &str, page_path: &PagePath, wikilink: bool) -> Option<String> {
     let target = raw
         .split_once('|')
@@ -343,6 +352,12 @@ fn normalize_link_target(raw: &str, page_path: &PagePath, wikilink: bool) -> Opt
         || lower.starts_with("javascript:")
         || lower.starts_with("tel:")
     {
+        return None;
+    }
+    // Ordinary Markdown destinations use URI reference syntax: a leading
+    // RFC 3986 scheme is external even without `://` (for example `ssh:` or
+    // `urn:`). Wikilinks keep their separate `project:path` scope grammar.
+    if !wikilink && has_uri_scheme(target) {
         return None;
     }
 
@@ -674,5 +689,16 @@ mod tests {
         let links = extract_links(body, &path);
         let paths: Vec<&str> = links.iter().map(|l| l.path.as_str()).collect();
         assert_eq!(paths, vec!["notes/kept.md"]);
+    }
+
+    #[test]
+    fn markdown_links_with_uri_schemes_are_not_graph_edges() {
+        let path = PagePath::new("notes/a.md").unwrap();
+        let body = "[ssh](ssh:host/page.md) [urn](urn:example:thing.md) \
+                    [vscode](vscode:notes/page.md) [git](git+ssh:host/page.md) \
+                    [drive](C:/notes/page.md) [legacy](./a:b.md) [[notes/kept]]";
+        let links = extract_links(body, &path);
+        let paths: Vec<&str> = links.iter().map(|l| l.path.as_str()).collect();
+        assert_eq!(paths, vec!["notes/a:b.md", "notes/kept.md"]);
     }
 }
