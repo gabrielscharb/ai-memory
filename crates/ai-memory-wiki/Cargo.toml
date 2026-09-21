@@ -33,6 +33,7 @@ async-trait.workspace = true
 # Admission webhook chain (sync HTTP calls before page persistence).
 reqwest.workspace = true
 futures-util.workspace = true
+pulldown-cmark = { version = "0.12", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 winapi-util = { workspace = true }

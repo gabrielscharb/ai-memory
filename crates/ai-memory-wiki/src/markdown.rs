@@ -9,6 +9,7 @@
 use std::collections::BTreeSet;
 
 use ai_memory_core::{LinkTarget, PagePath};
+use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 use serde::{Deserialize, Serialize};
 
 use crate::error::WikiResult;
@@ -123,20 +124,28 @@ type LinkKey = (Option<String>, Option<String>, String);
 #[must_use]
 pub fn extract_links(body: &str, page_path: &PagePath) -> Vec<LinkTarget> {
     let mut out: BTreeSet<LinkKey> = BTreeSet::new();
-    let mut in_fence = false;
+    let mut cursor = 0;
+    let mut block_start = None;
 
-    for line in body.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_fence = !in_fence;
-            continue;
+    // Use the Markdown parser's source ranges for code, rather than a second
+    // partial fence/backtick grammar. Links shown as examples must not become
+    // graph edges, dangling-link warnings, or retrieval-neighbor signals.
+    for (event, range) in Parser::new(body).into_offset_iter() {
+        let protected = match event {
+            Event::Start(Tag::CodeBlock(_)) => {
+                block_start = Some(range.start);
+                None
+            }
+            Event::End(TagEnd::CodeBlock) => block_start.take().map(|start| start..range.end),
+            Event::Code(_) => Some(range),
+            _ => None,
+        };
+        if let Some(protected) = protected {
+            extract_links_from_text(&body[cursor..protected.start], page_path, &mut out);
+            cursor = protected.end;
         }
-        if in_fence {
-            continue;
-        }
-        extract_wikilinks(line, page_path, &mut out);
-        extract_markdown_links(line, page_path, &mut out);
     }
+    extract_links_from_text(&body[cursor..], page_path, &mut out);
 
     out.into_iter()
         .filter_map(|(workspace, project, path)| {
@@ -148,6 +157,13 @@ pub fn extract_links(body: &str, page_path: &PagePath) -> Vec<LinkTarget> {
             })
         })
         .collect()
+}
+
+fn extract_links_from_text(text: &str, page_path: &PagePath, out: &mut BTreeSet<LinkKey>) {
+    for line in text.lines() {
+        extract_wikilinks(line, page_path, out);
+        extract_markdown_links(line, page_path, out);
+    }
 }
 
 /// Body wikilinks plus typed `relations:` frontmatter edges — the full
@@ -674,5 +690,22 @@ mod tests {
         let links = extract_links(body, &path);
         let paths: Vec<&str> = links.iter().map(|l| l.path.as_str()).collect();
         assert_eq!(paths, vec!["notes/kept.md"]);
+    }
+
+    #[test]
+    fn extract_links_ignores_commonmark_code_regions() {
+        let path = PagePath::new("notes/a.md").unwrap();
+        for body in [
+            "Use `[[notes/inline]]` literally, then [[notes/kept]].",
+            "Use `` `[[notes/double]]` `` literally, then [[notes/kept]].",
+            "Use `[fake](notes/markdown-code.md)` literally, then [[notes/kept]].",
+            "````\n```\n[[notes/inside-long-fence]]\n````\n[[notes/kept]]",
+            "> ```\n> [[notes/quoted-fence]]\n> ```\n\n[[notes/kept]]",
+            "    [[notes/indented-code]]\n\n[[notes/kept]]",
+        ] {
+            let links = extract_links(body, &path);
+            let paths: Vec<&str> = links.iter().map(|l| l.path.as_str()).collect();
+            assert_eq!(paths, vec!["notes/kept.md"], "body: {body:?}");
+        }
     }
 }

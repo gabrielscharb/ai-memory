@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   model ids, and which model goes through the Responses endpoint (#763).
 
 ### Fixed
+- Ignore wikilinks and Markdown links inside CommonMark code spans and code blocks when building stored graph edges, so literal examples do not create dependencies or dangling-link warnings. See [link extraction](docs/link-extraction-code-regions.md).
 - The Windows Docker wrapper (`bin/ai-memory.ps1`) now forwards the same
   provider credentials and host-config env vars as the POSIX wrapper into the
   helper container. A host-exported `GEMINI_API_KEY` / `GOOGLE_API_KEY`,
