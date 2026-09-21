@@ -315,16 +315,34 @@ fn extract_markdown_links(line: &str, page_path: &PagePath, out: &mut BTreeSet<L
             continue;
         }
         let target_start = close + 2;
-        let Some(rel_end) = line[target_start..].find(')') else {
+        let Some(target_end) = markdown_link_destination_end(line, target_start) else {
             break;
         };
-        let target_end = target_start + rel_end;
         let raw = &line[target_start..target_end];
         if let Some(path) = normalize_link_target(raw, page_path, false) {
             out.insert((None, None, path));
         }
         start_at = target_end + 1;
     }
+}
+
+fn markdown_link_destination_end(line: &str, target_start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut escaped = false;
+    for (offset, ch) in line[target_start..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '(' => depth += 1,
+            ')' if depth == 0 => return Some(target_start + offset),
+            ')' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
 }
 
 fn normalize_link_target(raw: &str, page_path: &PagePath, wikilink: bool) -> Option<String> {
@@ -674,5 +692,22 @@ mod tests {
         let links = extract_links(body, &path);
         let paths: Vec<&str> = links.iter().map(|l| l.path.as_str()).collect();
         assert_eq!(paths, vec!["notes/kept.md"]);
+    }
+
+    #[test]
+    fn markdown_links_with_balanced_parentheses_keep_full_destination() {
+        let path = PagePath::new("notes/a.md").unwrap();
+        let body = "[one](items/foo(bar).md) [nested](items/a(b(c)d)e.md) \
+                    [bad](items/unbalanced(one.md) [[notes/kept]]";
+        let links = extract_links(body, &path);
+        let paths: Vec<&str> = links.iter().map(|l| l.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "notes/items/a(b(c)d)e.md",
+                "notes/items/foo(bar).md",
+                "notes/kept.md",
+            ]
+        );
     }
 }
