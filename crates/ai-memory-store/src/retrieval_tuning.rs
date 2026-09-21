@@ -200,7 +200,10 @@ mod tests {
     fn latin_markers_accept_repeated_and_mixed_separators() {
         for marker in SESSION_RECALL_EN {
             for separator in [" ", "   ", "\t", "\r\n", ",\t ", " \u{00a0} "] {
-                let query = marker.split_whitespace().collect::<Vec<_>>().join(separator);
+                let query = marker
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(separator);
                 assert!(
                     is_session_recall_query(&query),
                     "marker {marker:?}, separator {separator:?}"

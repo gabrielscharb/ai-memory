@@ -248,6 +248,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   model ids, and which model goes through the Responses endpoint (#763).
 
 ### Fixed
+- Normalized repeated whitespace and punctuation separators in opt-in session-recall markers while preserving word boundaries and inert defaults. (#2)
 - The Windows Docker wrapper (`bin/ai-memory.ps1`) now forwards the same
   provider credentials and host-config env vars as the POSIX wrapper into the
   helper container. A host-exported `GEMINI_API_KEY` / `GOOGLE_API_KEY`,
