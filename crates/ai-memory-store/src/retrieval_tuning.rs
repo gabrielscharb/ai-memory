@@ -121,6 +121,8 @@ const SESSION_RECALL_EN: &[&str] = &[
 /// Route a query to session-recall retrieval by lexical markers. Deliberately
 /// zero-LLM: it gates a bounded ranking nudge, not a retrieval mode, and a
 /// false positive costs a few rank positions rather than a wrong answer.
+/// Repeated whitespace and punctuation separators between Latin marker words
+/// are equivalent to one space; alphabetic word boundaries are preserved.
 #[must_use]
 pub fn is_session_recall_query(query: &str) -> bool {
     let lowered = query.to_lowercase();
@@ -131,19 +133,21 @@ pub fn is_session_recall_query(query: &str) -> bool {
             .any(|m| padded.contains(&format!(" {m} ")))
 }
 
-/// Replace every non-alphanumeric Latin character with a space and pad the
-/// ends, so multi-word markers can be matched as ` word word `.
+/// Collapse runs of non-word characters to one space and pad the ends, so
+/// multi-word markers also match repeated whitespace and mixed separators.
 fn latin_word_padded(lowered: &str) -> String {
     let mut out = String::with_capacity(lowered.len() + 2);
     out.push(' ');
     for ch in lowered.chars() {
         if ch.is_ascii_alphanumeric() || (!ch.is_ascii() && ch.is_alphabetic()) {
             out.push(ch);
-        } else {
+        } else if !out.ends_with(' ') {
             out.push(' ');
         }
     }
-    out.push(' ');
+    if !out.ends_with(' ') {
+        out.push(' ');
+    }
     out
 }
 
@@ -190,5 +194,33 @@ mod tests {
     fn latin_markers_respect_word_boundaries() {
         assert!(!is_session_recall_query("unknown snowfall"));
         assert!(is_session_recall_query("what did we ship yesterday"));
+    }
+
+    #[test]
+    fn latin_markers_accept_repeated_and_mixed_separators() {
+        for marker in SESSION_RECALL_EN {
+            for separator in [" ", "   ", "\t", "\r\n", ",\t ", " \u{00a0} "] {
+                let query = marker.split_whitespace().collect::<Vec<_>>().join(separator);
+                assert!(
+                    is_session_recall_query(&query),
+                    "marker {marker:?}, separator {separator:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn collapsed_separators_do_not_join_partial_words() {
+        for query in [
+            "blast   timer",
+            "lastly\t session",
+            "last   timesheet",
+            "known,\t snowfall",
+            "",
+            " \t\r\n ",
+        ] {
+            assert!(!is_session_recall_query(query), "{query:?}");
+        }
+        assert_eq!(latin_word_padded("last,\t\n session"), " last session ");
     }
 }
