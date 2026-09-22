@@ -7,3 +7,5 @@ This keeps links such as `[outer [nested]](items/one.md)` and `[escaped \] brack
 The change is limited to link-text delimiter matching. Destination parsing, URI filtering, project scope, and storage behavior remain separate concerns.
 
 CommonMark 0.31.2 examples 512-515 cover balanced and escaped brackets in link text: https://spec.commonmark.org/0.31.2/#links
+
+Backtick code spans inside link text are opaque while matching brackets: bracket characters inside a code span are literal code, not link-text delimiters. The matcher therefore skips only a code span closed by a backtick run of the same length; an unmatched opening run remains ordinary text for delimiter scanning.

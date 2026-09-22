@@ -297,20 +297,60 @@ fn extract_wikilinks(line: &str, page_path: &PagePath, out: &mut BTreeSet<LinkKe
     }
 }
 
-fn markdown_link_text_end(line: &str, text_start: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    let mut escaped = false;
-    for (offset, ch) in line[text_start..].char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
+fn matching_backtick_run_end(line: &str, mut search_at: usize, run_len: usize) -> Option<usize> {
+    let bytes = line.as_bytes();
+    while search_at < bytes.len() {
+        let rel_start = line[search_at..].find('`')?;
+        let start = search_at + rel_start;
+        let mut end = start + 1;
+        while end < bytes.len() && bytes[end] == b'`' {
+            end += 1;
         }
-        match ch {
-            '\\' => escaped = true,
-            '[' => depth += 1,
-            ']' if depth == 0 => return Some(text_start + offset),
-            ']' => depth -= 1,
-            _ => {}
+        if end - start == run_len {
+            return Some(end);
+        }
+        search_at = end;
+    }
+    None
+}
+
+fn markdown_link_text_end(line: &str, text_start: usize) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut depth = 0usize;
+    let mut at = text_start;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\\' => {
+                at += 1;
+                if at < bytes.len() {
+                    let ch = line[at..].chars().next()?;
+                    if ch.is_ascii_punctuation() {
+                        at += ch.len_utf8();
+                    }
+                }
+            }
+            b'`' => {
+                let start = at;
+                while at < bytes.len() && bytes[at] == b'`' {
+                    at += 1;
+                }
+                let run_len = at - start;
+                if let Some(end) = matching_backtick_run_end(line, at, run_len) {
+                    at = end;
+                }
+            }
+            b'[' => {
+                depth += 1;
+                at += 1;
+            }
+            b']' if depth == 0 => return Some(at),
+            b']' => {
+                depth -= 1;
+                at += 1;
+            }
+            _ => {
+                at += line[at..].chars().next()?.len_utf8();
+            }
         }
     }
     None
@@ -709,6 +749,22 @@ mod tests {
                 "notes/items/inner.md",
                 "notes/items/one.md",
                 "notes/items/two.md",
+            ]
+        );
+    }
+
+    #[test]
+    fn markdown_link_text_code_spans_are_opaque_to_bracket_matching() {
+        let path = PagePath::new("notes/a.md").unwrap();
+        let body = "[open `[` code](items/open.md) [close `]` code](items/close.md) [paired ``[x]`` code](items/paired.md)";
+        let links = extract_links(body, &path);
+        let paths: Vec<&str> = links.iter().map(|l| l.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "notes/items/close.md",
+                "notes/items/open.md",
+                "notes/items/paired.md",
             ]
         );
     }
