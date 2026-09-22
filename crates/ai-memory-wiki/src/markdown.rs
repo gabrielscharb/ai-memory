@@ -315,16 +315,43 @@ fn extract_markdown_links(line: &str, page_path: &PagePath, out: &mut BTreeSet<L
             continue;
         }
         let target_start = close + 2;
-        let Some(rel_end) = line[target_start..].find(')') else {
+        let Some(target_end) = find_markdown_destination_end(line, target_start) else {
             break;
         };
-        let target_end = target_start + rel_end;
         let raw = &line[target_start..target_end];
         if let Some(path) = normalize_link_target(raw, page_path, false) {
             out.insert((None, None, path));
         }
         start_at = target_end + 1;
     }
+}
+
+fn find_markdown_destination_end(line: &str, target_start: usize) -> Option<usize> {
+    let rest = &line[target_start..];
+    if !rest.starts_with('<') {
+        return rest.find(')').map(|rel| target_start + rel);
+    }
+
+    // In CommonMark's <...> form, ')' is ordinary destination content.
+    // Find the closing angle bracket first, then the inline link delimiter.
+    let mut escaped = false;
+    for (offset, ch) in rest.char_indices().skip(1) {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == '>' {
+            let after_angle = offset + ch.len_utf8();
+            return rest[after_angle..]
+                .find(')')
+                .map(|rel| target_start + after_angle + rel);
+        }
+    }
+    None
 }
 
 fn normalize_link_target(raw: &str, page_path: &PagePath, wikilink: bool) -> Option<String> {
@@ -665,6 +692,14 @@ mod tests {
             paths,
             vec!["decisions/0001-single-sqlite-file.md", "gotchas/hooks.md"]
         );
+    }
+
+    #[test]
+    fn extract_links_angle_destination_keeps_parenthesis() {
+        let path = PagePath::new("notes/here.md").unwrap();
+        let links = extract_links("[x](<items/foo)bar.md>)", &path);
+        let paths: Vec<&str> = links.iter().map(|l| l.path.as_str()).collect();
+        assert_eq!(paths, vec!["notes/items/foo)bar.md"]);
     }
 
     #[test]
