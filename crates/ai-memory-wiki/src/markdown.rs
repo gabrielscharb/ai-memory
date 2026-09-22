@@ -315,16 +315,88 @@ fn extract_markdown_links(line: &str, page_path: &PagePath, out: &mut BTreeSet<L
             continue;
         }
         let target_start = close + 2;
-        let Some(rel_end) = line[target_start..].find(')') else {
+        let Some((target_end, link_end)) =
+            find_markdown_destination_and_link_end(line, target_start)
+        else {
             break;
         };
-        let target_end = target_start + rel_end;
         let raw = &line[target_start..target_end];
         if let Some(path) = normalize_link_target(raw, page_path, false) {
             out.insert((None, None, path));
         }
-        start_at = target_end + 1;
+        start_at = link_end + 1;
     }
+}
+
+fn find_markdown_destination_and_link_end(
+    line: &str,
+    target_start: usize,
+) -> Option<(usize, usize)> {
+    let rest = &line[target_start..];
+    let mut escaped = false;
+
+    for (offset, ch) in rest.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == ')' {
+            let end = target_start + offset;
+            return Some((end, end));
+        }
+        if !matches!(ch, ' ' | '\t') {
+            continue;
+        }
+
+        let target_end = target_start + offset;
+        let after_destination = &rest[offset..];
+        let next = after_destination.find(|c: char| !matches!(c, ' ' | '\t'))?;
+        let title_start = offset + next;
+        let title_rest = &rest[title_start..];
+
+        if title_rest.starts_with(')') {
+            return Some((target_end, target_start + title_start));
+        }
+
+        let opener = title_rest.chars().next()?;
+        let closer = match opener {
+            '"' => '"',
+            '\'' => '\'',
+            '(' => ')',
+            _ => return None,
+        };
+
+        let after_opener = title_start + opener.len_utf8();
+        let mut title_escaped = false;
+        for (rel, title_ch) in rest[after_opener..].char_indices() {
+            if title_escaped {
+                title_escaped = false;
+                continue;
+            }
+            if title_ch == '\\' {
+                title_escaped = true;
+                continue;
+            }
+            if title_ch != closer {
+                continue;
+            }
+
+            let after_title = after_opener + rel + title_ch.len_utf8();
+            let tail = &rest[after_title..];
+            let close_rel = tail.find(|c: char| !matches!(c, ' ' | '\t'))?;
+            if tail[close_rel..].starts_with(')') {
+                return Some((target_end, target_start + after_title + close_rel));
+            }
+            return None;
+        }
+        return None;
+    }
+
+    None
 }
 
 fn normalize_link_target(raw: &str, page_path: &PagePath, wikilink: bool) -> Option<String> {
@@ -664,6 +736,23 @@ mod tests {
         assert_eq!(
             paths,
             vec!["decisions/0001-single-sqlite-file.md", "gotchas/hooks.md"]
+        );
+    }
+
+    #[test]
+    fn extract_links_with_optional_titles_keep_destination() {
+        let path = PagePath::new("notes/here.md").unwrap();
+        let body = r#"[double](items/double.md "Double title") [single](items/single.md 'Single title') [paren](items/paren.md (Paren title)) [spaces](items/spaces.md   )"#;
+        let links = extract_links(body, &path);
+        let paths: Vec<&str> = links.iter().map(|link| link.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "notes/items/double.md",
+                "notes/items/paren.md",
+                "notes/items/single.md",
+                "notes/items/spaces.md",
+            ]
         );
     }
 
