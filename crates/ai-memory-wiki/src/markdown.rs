@@ -297,6 +297,25 @@ fn extract_wikilinks(line: &str, page_path: &PagePath, out: &mut BTreeSet<LinkKe
     }
 }
 
+fn markdown_link_text_end(line: &str, text_start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut escaped = false;
+    for (offset, ch) in line[text_start..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '[' => depth += 1,
+            ']' if depth == 0 => return Some(text_start + offset),
+            ']' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
 fn extract_markdown_links(line: &str, page_path: &PagePath, out: &mut BTreeSet<LinkKey>) {
     let mut start_at = 0;
     while let Some(rel_start) = line[start_at..].find('[') {
@@ -306,10 +325,12 @@ fn extract_markdown_links(line: &str, page_path: &PagePath, out: &mut BTreeSet<L
             continue;
         }
         let after_start = start + 1;
-        let Some(rel_close) = line[after_start..].find(']') else {
-            break;
+        let Some(close) = markdown_link_text_end(line, after_start) else {
+            // An unmatched outer bracket can still contain a valid inner
+            // link, so advance one byte and let the next scan find it.
+            start_at = start + 1;
+            continue;
         };
-        let close = after_start + rel_close;
         if !line[close + 1..].starts_with('(') {
             start_at = close + 1;
             continue;
@@ -674,5 +695,21 @@ mod tests {
         let links = extract_links(body, &path);
         let paths: Vec<&str> = links.iter().map(|l| l.path.as_str()).collect();
         assert_eq!(paths, vec!["notes/kept.md"]);
+    }
+
+    #[test]
+    fn markdown_links_with_balanced_or_escaped_brackets_in_text_are_extracted() {
+        let path = PagePath::new("notes/a.md").unwrap();
+        let body = "[outer [nested]](items/one.md) [escaped \\] bracket](items/two.md) [outer [inner](items/inner.md)";
+        let links = extract_links(body, &path);
+        let paths: Vec<&str> = links.iter().map(|l| l.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "notes/items/inner.md",
+                "notes/items/one.md",
+                "notes/items/two.md",
+            ]
+        );
     }
 }
