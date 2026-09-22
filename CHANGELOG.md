@@ -32,6 +32,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   model ids, and which model goes through the Responses endpoint (#763).
 
 ### Fixed
+- Wiki graph extraction of ordinary `[text](dest)` Markdown links now reads
+  them from the CommonMark parser's own link events instead of a hand-rolled
+  scanner, fixing several related mis-extractions in one pass: links inside
+  code spans/fenced code blocks were turned into graph edges and dangling-link
+  warnings; a destination with nested parentheses (`(foo(bar).md)`) was
+  truncated at the first `)`; link text with nested brackets
+  (`[a [b] c](...)`) was split incorrectly; a non-`http(s)` URI scheme
+  (`ssh:`, `urn:`, `vscode:`, …) without a `//` authority was indexed as an
+  internal page; an angle-bracket destination (`<foo)bar.md>`) was cut short
+  at the parenthesis inside it; and an optional link title
+  (`(dest "title")`) was included in the extracted path. `[[wikilinks]]`
+  remain a dedicated scan (not CommonMark syntax) but now reuse the parser's
+  source ranges to skip code regions the same way. See
+  [wiki link extraction](docs/wiki-link-extraction.md).
 - A failed scheduled `auto_improve` review no longer removes its session from
   the queue permanently. The scheduler claims a session before reviewing it,
   and the candidate query excludes any session that holds a claim — but nothing

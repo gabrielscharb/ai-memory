@@ -300,6 +300,7 @@ dependencies = [
  "jiff",
  "notify",
  "notify-debouncer-full",
+ "pulldown-cmark",
  "reqwest 0.12.28",
  "rusqlite",
  "serde",

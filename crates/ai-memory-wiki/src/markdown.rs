@@ -9,6 +9,7 @@
 use std::collections::BTreeSet;
 
 use ai_memory_core::{LinkTarget, PagePath};
+use pulldown_cmark::{Event, LinkType, Parser, Tag, TagEnd};
 use serde::{Deserialize, Serialize};
 
 use crate::error::WikiResult;
@@ -123,20 +124,60 @@ type LinkKey = (Option<String>, Option<String>, String);
 #[must_use]
 pub fn extract_links(body: &str, page_path: &PagePath) -> Vec<LinkTarget> {
     let mut out: BTreeSet<LinkKey> = BTreeSet::new();
-    let mut in_fence = false;
+    let mut cursor = 0;
+    let mut block_start = None;
 
-    for line in body.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_fence = !in_fence;
-            continue;
+    // Ordinary `[text](dest "title")` links are read straight from the
+    // parser's own `Tag::Link` events: CommonMark's grammar for link text
+    // (nested brackets, code spans), destinations (balanced parens,
+    // `<...>` form), and optional titles is exactly what pulldown-cmark
+    // already implements to render this same body elsewhere. A second,
+    // hand-rolled implementation of that grammar here just accumulates its
+    // own set of CommonMark edge cases to chase one at a time.
+    //
+    // `[[wikilinks]]` aren't CommonMark syntax, so they still need a
+    // dedicated scan — but it reuses the parser's source ranges to skip
+    // code spans/blocks, so an example wikilink written inside `` `code` ``
+    // doesn't turn into a graph edge, dangling-link warning, or retrieval
+    // neighbor.
+    for (event, range) in Parser::new(body).into_offset_iter() {
+        match event {
+            Event::Start(Tag::CodeBlock(_)) => block_start = Some(range.start),
+            Event::End(TagEnd::CodeBlock) => {
+                if let Some(start) = block_start.take() {
+                    extract_wikilinks_from_text(&body[cursor..start], page_path, &mut out);
+                    cursor = range.end;
+                }
+            }
+            Event::Code(_) => {
+                extract_wikilinks_from_text(&body[cursor..range.start], page_path, &mut out);
+                cursor = range.end;
+            }
+            Event::Start(Tag::Link {
+                link_type,
+                dest_url,
+                ..
+            }) => {
+                // `*Unknown` link types are the parser's broken-link-callback
+                // hook for an unresolved reference (`[text][no-such-ref]`);
+                // without a callback registered, `dest_url` is empty and
+                // this is not a real link.
+                if matches!(
+                    link_type,
+                    LinkType::ReferenceUnknown
+                        | LinkType::CollapsedUnknown
+                        | LinkType::ShortcutUnknown
+                ) {
+                    continue;
+                }
+                if let Some(path) = normalize_link_target(&dest_url, page_path, false) {
+                    out.insert((None, None, path));
+                }
+            }
+            _ => {}
         }
-        if in_fence {
-            continue;
-        }
-        extract_wikilinks(line, page_path, &mut out);
-        extract_markdown_links(line, page_path, &mut out);
     }
+    extract_wikilinks_from_text(&body[cursor..], page_path, &mut out);
 
     out.into_iter()
         .filter_map(|(workspace, project, path)| {
@@ -278,6 +319,12 @@ fn split_scope(target: &str) -> LinkKey {
     (None, None, target.to_string())
 }
 
+fn extract_wikilinks_from_text(text: &str, page_path: &PagePath, out: &mut BTreeSet<LinkKey>) {
+    for line in text.lines() {
+        extract_wikilinks(line, page_path, out);
+    }
+}
+
 fn extract_wikilinks(line: &str, page_path: &PagePath, out: &mut BTreeSet<LinkKey>) {
     let mut rest = line;
     while let Some(start) = rest.find("[[") {
@@ -297,43 +344,29 @@ fn extract_wikilinks(line: &str, page_path: &PagePath, out: &mut BTreeSet<LinkKe
     }
 }
 
-fn extract_markdown_links(line: &str, page_path: &PagePath, out: &mut BTreeSet<LinkKey>) {
-    let mut start_at = 0;
-    while let Some(rel_start) = line[start_at..].find('[') {
-        let start = start_at + rel_start;
-        if start > 0 && line.as_bytes()[start - 1] == b'!' {
-            start_at = start + 1;
-            continue;
-        }
-        let after_start = start + 1;
-        let Some(rel_close) = line[after_start..].find(']') else {
-            break;
-        };
-        let close = after_start + rel_close;
-        if !line[close + 1..].starts_with('(') {
-            start_at = close + 1;
-            continue;
-        }
-        let target_start = close + 2;
-        let Some(rel_end) = line[target_start..].find(')') else {
-            break;
-        };
-        let target_end = target_start + rel_end;
-        let raw = &line[target_start..target_end];
-        if let Some(path) = normalize_link_target(raw, page_path, false) {
-            out.insert((None, None, path));
-        }
-        start_at = target_end + 1;
-    }
+/// True when `target` starts with an RFC 3986 URI scheme (`scheme:`) — for
+/// example `ssh:`, `urn:`, `vscode:`, `git+ssh:`. Ordinary Markdown link
+/// destinations use full URI-reference syntax, so any leading scheme marks
+/// an external target even without a `//` authority. A single-letter
+/// scheme (`c:`) also matches, which is intentional: it catches a Windows
+/// drive-letter destination too. `./a:b.md` avoids this on purpose — a
+/// leading `./` is not itself a valid scheme character, so it stays a
+/// relative page path.
+fn has_uri_scheme(target: &str) -> bool {
+    let Some((scheme, _)) = target.split_once(':') else {
+        return false;
+    };
+    let mut chars = scheme.chars();
+    matches!(chars.next(), Some(first) if first.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
 }
 
 fn normalize_link_target(raw: &str, page_path: &PagePath, wikilink: bool) -> Option<String> {
-    let target = raw
-        .split_once('|')
-        .map_or(raw, |(path, _)| path)
-        .trim()
-        .trim_matches('<')
-        .trim_matches('>');
+    // Shared by both callers. For a Markdown link this is a no-op: the
+    // parser already strips a `<...>` destination wrapper before `dest_url`
+    // gets here. For a wikilink, `raw` is hand-scanned text, so an
+    // incidental `<...>` around it is still worth trimming defensively.
+    let target = raw.trim().trim_matches('<').trim_matches('>');
     if target.is_empty() || target.starts_with('#') || target.contains("://") {
         return None;
     }
@@ -343,6 +376,13 @@ fn normalize_link_target(raw: &str, page_path: &PagePath, wikilink: bool) -> Opt
         || lower.starts_with("javascript:")
         || lower.starts_with("tel:")
     {
+        return None;
+    }
+    // Ordinary Markdown destinations use URI-reference syntax: a leading
+    // RFC 3986 scheme is external even without `://` (for example `ssh:`
+    // or `urn:`). Wikilinks keep their own separate `project:path` scope
+    // grammar, already peeled off by `split_scope` before this is called.
+    if !wikilink && has_uri_scheme(target) {
         return None;
     }
 
@@ -674,5 +714,157 @@ mod tests {
         let links = extract_links(body, &path);
         let paths: Vec<&str> = links.iter().map(|l| l.path.as_str()).collect();
         assert_eq!(paths, vec!["notes/kept.md"]);
+    }
+
+    #[test]
+    fn extract_links_ignores_commonmark_code_regions() {
+        let path = PagePath::new("notes/a.md").unwrap();
+        for body in [
+            "Use `[[notes/inline]]` literally, then [[notes/kept]].",
+            "Use `` `[[notes/double]]` `` literally, then [[notes/kept]].",
+            "Use `[fake](notes/markdown-code.md)` literally, then [[notes/kept]].",
+            "````\n```\n[[notes/inside-long-fence]]\n````\n[[notes/kept]]",
+            "> ```\n> [[notes/quoted-fence]]\n> ```\n\n[[notes/kept]]",
+            "    [[notes/indented-code]]\n\n[[notes/kept]]",
+        ] {
+            let links = extract_links(body, &path);
+            let paths: Vec<&str> = links.iter().map(|l| l.path.as_str()).collect();
+            assert_eq!(paths, vec!["notes/kept.md"], "body: {body:?}");
+        }
+    }
+
+    #[test]
+    fn markdown_links_with_uri_schemes_are_not_graph_edges() {
+        let path = PagePath::new("notes/a.md").unwrap();
+        let body = "[ssh](ssh:host/page.md) [urn](urn:example:thing.md) \
+                    [vscode](vscode:notes/page.md) [git](git+ssh:host/page.md) \
+                    [drive](C:/notes/page.md) [legacy](./a:b.md) [[notes/kept]]";
+        let links = extract_links(body, &path);
+        let paths: Vec<&str> = links.iter().map(|l| l.path.as_str()).collect();
+        assert_eq!(paths, vec!["notes/a:b.md", "notes/kept.md"]);
+    }
+
+    #[test]
+    fn markdown_links_with_balanced_parentheses_keep_full_destination() {
+        let path = PagePath::new("notes/a.md").unwrap();
+        let body = "[one](items/foo(bar).md) [nested](items/a(b(c)d)e.md) \
+                    [bad](items/unbalanced(one.md) [[notes/kept]]";
+        let links = extract_links(body, &path);
+        let paths: Vec<&str> = links.iter().map(|l| l.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "notes/items/a(b(c)d)e.md",
+                "notes/items/foo(bar).md",
+                "notes/kept.md",
+            ]
+        );
+    }
+
+    #[test]
+    fn markdown_links_with_balanced_or_escaped_brackets_in_text_are_extracted() {
+        let path = PagePath::new("notes/a.md").unwrap();
+        let body = "[outer [nested]](items/one.md) [escaped \\] bracket](items/two.md) [outer [inner](items/inner.md)";
+        let links = extract_links(body, &path);
+        let paths: Vec<&str> = links.iter().map(|l| l.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "notes/items/inner.md",
+                "notes/items/one.md",
+                "notes/items/two.md",
+            ]
+        );
+    }
+
+    #[test]
+    fn markdown_link_text_code_spans_are_opaque_to_bracket_matching() {
+        let path = PagePath::new("notes/a.md").unwrap();
+        let body = "[open `[` code](items/open.md) [close `]` code](items/close.md) [paired ``[x]`` code](items/paired.md)";
+        let links = extract_links(body, &path);
+        let paths: Vec<&str> = links.iter().map(|l| l.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "notes/items/close.md",
+                "notes/items/open.md",
+                "notes/items/paired.md",
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_links_angle_destination_keeps_parenthesis() {
+        let path = PagePath::new("notes/here.md").unwrap();
+        let links = extract_links("[x](<items/foo)bar.md>)", &path);
+        let paths: Vec<&str> = links.iter().map(|l| l.path.as_str()).collect();
+        assert_eq!(paths, vec!["notes/items/foo)bar.md"]);
+    }
+
+    #[test]
+    fn extract_links_with_optional_titles_keep_destination() {
+        let path = PagePath::new("notes/here.md").unwrap();
+        let body = r#"[double](items/double.md "Double title") [single](items/single.md 'Single title') [paren](items/paren.md (Paren title)) [spaces](items/spaces.md   )"#;
+        let links = extract_links(body, &path);
+        let paths: Vec<&str> = links.iter().map(|link| link.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "notes/items/double.md",
+                "notes/items/paren.md",
+                "notes/items/single.md",
+                "notes/items/spaces.md",
+            ]
+        );
+    }
+
+    /// Regression guard: an earlier hand-rolled paren-balance tracker used
+    /// to `break` the whole-line scan on an unclosed destination, silently
+    /// dropping every later link on the same line along with the malformed
+    /// one. Parser-event extraction can't have that failure mode — a failed
+    /// link is just an event the parser never emits, the rest of the
+    /// document is unaffected.
+    #[test]
+    fn malformed_link_does_not_drop_later_links_on_the_same_line() {
+        let path = PagePath::new("notes/a.md").unwrap();
+        let body = "[bad](unterminated(oops.md) and later [good](good.md)";
+        let links = extract_links(body, &path);
+        let paths: Vec<&str> = links.iter().map(|l| l.path.as_str()).collect();
+        assert_eq!(paths, vec!["notes/good.md"]);
+    }
+
+    /// Documents an intentional behavior change, not a bug: CommonMark
+    /// requires a bare (non-`<...>`-wrapped) destination to have no
+    /// unescaped whitespace. A destination with a literal space and no
+    /// `<...>` wrapper or title is therefore not a valid link at all, so
+    /// the old permissive scanner "extracting" it was itself the bug —
+    /// spec-compliant parsing intentionally drops it. Use `<...>` around a
+    /// destination that needs a literal space.
+    #[test]
+    fn bare_destination_with_unescaped_space_and_no_title_is_not_a_link() {
+        let path = PagePath::new("notes/a.md").unwrap();
+        let body = "[spaced file](items/my file.md) [[notes/kept]]";
+        let links = extract_links(body, &path);
+        let paths: Vec<&str> = links.iter().map(|l| l.path.as_str()).collect();
+        assert_eq!(paths, vec!["notes/kept.md"]);
+
+        let escaped = "[spaced file](<items/my file.md>) [[notes/kept]]";
+        let links = extract_links(escaped, &path);
+        let paths: Vec<&str> = links.iter().map(|l| l.path.as_str()).collect();
+        assert_eq!(paths, vec!["notes/items/my file.md", "notes/kept.md"]);
+    }
+
+    /// Reference-style links (`[text][ref]` plus a `[ref]: dest` definition)
+    /// were never supported by the old hand-rolled scanner at all — it only
+    /// recognized the immediate `](` inline form. The parser resolves these
+    /// natively, and correctly treats an unresolved reference as plain text
+    /// rather than a link.
+    #[test]
+    fn reference_style_links_resolve_through_their_definition() {
+        let path = PagePath::new("notes/a.md").unwrap();
+        let body = "See [the doc][ref] and [an unresolved one][missing].\n\n[ref]: items/target.md";
+        let links = extract_links(body, &path);
+        let paths: Vec<&str> = links.iter().map(|l| l.path.as_str()).collect();
+        assert_eq!(paths, vec!["notes/items/target.md"]);
     }
 }
